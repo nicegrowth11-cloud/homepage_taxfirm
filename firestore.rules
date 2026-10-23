@@ -1,0 +1,34 @@
+rules_version = '2';
+// 상담신청 저장소 보안 규칙 (자동 생성: shared/gen_rules.py ← consult-forms.json)
+// - 서버(/api/consult)는 서비스 계정으로 쓰므로 규칙을 우회합니다. 아래 규칙은 클라이언트 SDK 직접 접근에 대한 방어선입니다.
+// - 공개 조회·수정·삭제 불가. 생성은 필드 화이트리스트·길이·선택지 검증을 통과한 경우만 허용.
+// - 클라이언트 직접 쓰기를 쓰지 않는다면 `allow create: if false;` 로 더 좁혀도 됩니다(권장).
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function isStr(v, min, max) { return v is string && v.size() >= min && v.size() <= max; }
+    function validAnswers(d, a) {
+      return a is map && ((d.field == 'medical' && a.keys().hasOnly(['status', 'specialty']) && (!('status' in a) || (a.status in ['개원 준비 중', '개원 1년 미만', '개원 1~3년', '개원 3년 이상'])) && (!('specialty' in a) || (isStr(a.specialty, 0, 30)))) || (d.field == 'realestate' && a.keys().hasOnly(['topic', 'timing']) && a.topic in ['취득', '보유·임대', '양도', '상속·증여', '기타'] && (!('timing' in a) || (a.timing in ['1개월 이내', '1~3개월', '3개월 이후', '미정']))) || (d.field == 'startup' && a.keys().hasOnly(['form', 'industry']) && (!('form' in a) || (a.form in ['개인사업자', '법인', '아직 모름'])) && (!('industry' in a) || (isStr(a.industry, 0, 60)))) || (d.field == 'other' && a.keys().size() == 0));
+    }
+    function validRequest(d) {
+      return d.keys().hasOnly(['site', 'field', 'name', 'phone', 'email', 'message', 'answers', 'consent', 'consentVersion', 'status', 'createdAt'])
+        && d.keys().hasAll(['site', 'field', 'name', 'phone', 'answers', 'consent', 'consentVersion', 'status', 'createdAt'])
+        && d.site == 'homepage-taxfirm'
+        && isStr(d.name, 2, 40)
+        && d.phone is string && d.phone.matches('^0[0-9]{1,2}-?[0-9]{3,4}-?[0-9]{4}$')
+        && (!('email' in d) || isStr(d.email, 0, 120))
+        && (!('message' in d) || isStr(d.message, 0, 1000))
+        && validAnswers(d, d.answers)
+        && d.consent == true
+        && d.consentVersion == '2026-10-23'
+        && d.status == 'new'
+        && d.createdAt == request.time;
+    }
+    match /consultation_requests/{docId} {
+      allow create: if validRequest(request.resource.data);
+      allow read, update, delete: if false;
+    }
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
