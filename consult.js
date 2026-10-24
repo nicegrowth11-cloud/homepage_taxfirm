@@ -1,8 +1,27 @@
-/* 상담신청 다이얼로그 — innerHTML 미사용(모든 텍스트는 textContent), 입력 내용은 브라우저에 저장하지 않음 */
+/* 상담신청 다이얼로그 — innerHTML 미사용(모든 텍스트는 textContent), 입력 내용은 브라우저에 저장하지 않음
+   유입 경로(utm_* 5종, 첫 접속 페이지 주소, 이전 페이지 주소)만 sessionStorage 에 보관(탭·브라우저를 닫으면 삭제, localStorage·쿠키 미사용)하고
+   신청서의 숨은 항목으로 함께 전송합니다. */
 (function () {
   'use strict';
   var PHONE_TEXT = '전화 02-523-8434';
   var config = null, dialog = null, els = {}, token = null, current = null, labelOverride = null;
+
+  var UTM_KEYS = ['utm_source', 'utm_medium', 'utm_campaign', 'utm_content', 'utm_term'];
+  var TRACK_KEYS = UTM_KEYS.concat(['landingUrl', 'referrer']);
+  var TRACK_STORE = 'bhl_consult_src';
+  function pageUrl(u) { try { var x = new URL(u); return /^https?:$/.test(x.protocol) ? (x.origin + x.pathname).slice(0, 300) : ''; } catch (e) { return ''; } }
+  function readTrack() { try { return JSON.parse(window.sessionStorage.getItem(TRACK_STORE) || 'null') || {}; } catch (e) { return {}; } }
+  /* utm 값이 있는 주소로 들어오면 그 값으로 갱신, 없으면 이번 세션의 첫 값을 유지 */
+  function captureTrack() {
+    var prev = readTrack(), q, now = {}, hasUtm = false;
+    try { q = new URLSearchParams(window.location.search); } catch (e) { return; }
+    UTM_KEYS.forEach(function (k) { var v = (q.get(k) || '').trim().slice(0, 100); now[k] = v; if (v) hasUtm = true; });
+    if (!hasUtm && prev.landingUrl !== undefined) return;
+    now.landingUrl = pageUrl(window.location.href);
+    now.referrer = document.referrer && pageUrl(document.referrer).indexOf(window.location.origin) !== 0 ? pageUrl(document.referrer) : (prev.referrer || '');
+    try { window.sessionStorage.setItem(TRACK_STORE, JSON.stringify(now)); } catch (e) {}
+  }
+  captureTrack();
 
   function h(tag, attrs, children) {
     var el = document.createElement(tag);
@@ -153,6 +172,8 @@
       h('label', { for: 'c-website', text: '웹사이트' }),
       h('input', { id: 'c-website', name: 'website', type: 'text', tabindex: '-1', autocomplete: 'off' })
     ]));
+    var track = readTrack();
+    TRACK_KEYS.forEach(function (k) { els.form.appendChild(h('input', { type: 'hidden', name: k, value: typeof track[k] === 'string' ? track[k] : '' })); });
     if (config.consents) els.form.appendChild(consentBlock());
     else els.form.appendChild(h('div', { className: 'consult-consent' }, [
       h('label', { for: 'c-consent' }, [h('input', { id: 'c-consent', name: 'consent', type: 'checkbox', required: true }), ' [필수] 개인정보 수집·이용에 동의합니다']),
@@ -179,6 +200,7 @@
     }
     if (!requiredConsentsOk()) { els.status.textContent = '필수 동의 항목에 체크해 주세요.'; return; }
     var payload = { field: current.key, token: token, website: form.elements.website.value };
+    TRACK_KEYS.forEach(function (k) { var el = form.elements[k]; if (el && el.value) payload[k] = el.value; });
     if (config.consents) {
       payload.consents = {};
       config.consents.forEach(function (d) { payload.consents[d.key] = !!form.querySelector('[data-consent="' + d.key + '"]').checked; });

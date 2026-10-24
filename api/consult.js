@@ -12,6 +12,10 @@
  *  - 원본 IP·User-Agent 미저장, 응답에 입력값을 되돌려주지 않음
  *  - 민감정보 차단: 주민등록번호·계좌번호 형태가 입력되면 저장하지 않고 400(SENSITIVE)
  *  - 동의: consent-forms.json 의 consents(항목별 필수/선택)가 있으면 항목별 동의값·동의 시각·문구 버전을 함께 저장
+ *  - 유입 경로: utm_source/medium/campaign/content/term(각 최대 100자, 허용 문자 외에는 빈 값으로 대체 — 신청 자체는 거부하지 않음),
+ *    landingUrl·referrer(http(s) 주소의 origin+경로만, 쿼리·해시 제거). leads_common.csv 열 이름으로 된 leadsCsv 맵도 함께 저장
+ *  - 알림 메일(선택): RESEND_API_KEY 와 NOTIFY_TO 가 모두 있을 때만 저장 성공 후 Resend HTTP API로 일반 텍스트 메일 발송.
+ *    없으면 조용히 건너뜀. 발송 실패는 신청 결과에 영향 없음. 키·수신 주소·입력값은 로그에 남기지 않음
  */
 const crypto = require('crypto');
 const CONFIG = require('../consult-forms.json');
@@ -99,6 +103,57 @@ function tokenAgeOk(token, now) {
   return age >= MIN_FILL_MS && age <= MAX_FILL_MS;
 }
 
+/* ---------- 유입 경로(UTM) ---------- */
+const UTM_KEYS = ['utm_source', 'utm_medium', 'utm_campaign', 'utm_content', 'utm_term'];
+const URL_KEYS = ['landingUrl', 'referrer'];
+const UTM_MAX = 100;
+const URL_MAX = 300;
+const UTM_ALLOWED = /^[A-Za-z0-9 가-힣_.+%-]*$/;
+// /workspace/sales/leads_common.csv 헤더의 열 이름 그대로 (열 이름이 바뀌면 여기만 수정)
+const CSV_COL = {
+  channel: '유입채널(유튜브/블로그/인스타/카카오/홈페이지/소개/기타)',
+  path: '유입경로(어느 영상·utm_content)',
+  campaign: 'utm_campaign',
+};
+function cleanUtm(v) {
+  if (typeof v !== 'string') return '';
+  const t = v.replace(CONTROL, '').trim();
+  if (!t || [...t].length > UTM_MAX || !UTM_ALLOWED.test(t)) return '';
+  return t;
+}
+function cleanUrl(v) {
+  if (typeof v !== 'string' || !v || v.length > 2000) return '';
+  let u;
+  try { u = new URL(v.trim()); } catch { return ''; }
+  if (u.protocol !== 'https:' && u.protocol !== 'http:') return '';
+  const out = u.origin + u.pathname; // 쿼리·해시·계정정보 제거(개인정보 최소화)
+  return out.length > URL_MAX || /[\s<>"'`]/.test(out) ? '' : out;
+}
+function hostOf(url) { try { return new URL(url).hostname.toLowerCase(); } catch { return ''; } }
+function channelOf(src, referrer) {
+  const s = String(src || '').toLowerCase().replace(/[\s_-]/g, '');
+  if (s) {
+    if (/^(youtube|yt|유튜브)/.test(s)) return '유튜브';
+    if (/(blog|블로그|tistory|brunch)/.test(s)) return '블로그';
+    if (/^(instagram|insta|ig|인스타)/.test(s)) return '인스타';
+    if (/^(kakao|카카오)/.test(s)) return '카카오';
+    return '기타';
+  }
+  const h = hostOf(referrer);
+  if (!h) return '홈페이지';
+  if (/(^|\.)(youtube\.com|youtu\.be)$/.test(h)) return '유튜브';
+  if (/(^|\.)(blog\.naver\.com|tistory\.com|brunch\.co\.kr)$/.test(h)) return '블로그';
+  if (/(^|\.)instagram\.com$/.test(h)) return '인스타';
+  if (/(^|\.)(kakao\.com|kakaocdn\.net)$/.test(h)) return '카카오';
+  return '홈페이지';
+}
+function tracking(body) {
+  const t = {};
+  for (const k of UTM_KEYS) t[k] = cleanUtm(body[k]);
+  for (const k of URL_KEYS) t[k] = cleanUrl(body[k]);
+  return t;
+}
+
 function clean(v) { return typeof v === 'string' ? v.replace(CONTROL, '').replace(/\r\n?/g, '\n').trim() : null; }
 
 function checkInput(def, raw, errors) {
@@ -122,7 +177,7 @@ function validate(body) {
   if (!field) return { errors: ['field'] };
   const defs = [...field.inputs, ...CONFIG.common];
   const consentKey = CONFIG.consents ? 'consents' : 'consent';
-  const allowedKeys = new Set(['field', 'website', 'token', consentKey, ...defs.map((d) => d.name)]);
+  const allowedKeys = new Set(['field', 'website', 'token', consentKey, ...UTM_KEYS, ...URL_KEYS, ...defs.map((d) => d.name)]);
   for (const k of Object.keys(body)) if (!allowedKeys.has(k)) errors.push('unknown');
   const data = {};
   for (const def of defs) { const v = checkInput(def, body[def.name], errors); if (v !== undefined) data[def.name] = v; }
@@ -163,7 +218,7 @@ async function storeFirestore(record) {
   const token = await googleAccessToken();
   const fields = {};
   for (const [k, v] of Object.entries(record)) {
-    if (k === 'answers') fields.answers = { mapValue: { fields: Object.fromEntries(Object.entries(v).map(([a, b]) => [a, { stringValue: b }])) } };
+    if (v && typeof v === 'object') fields[k] = { mapValue: { fields: Object.fromEntries(Object.entries(v).map(([a, b]) => [a, { stringValue: String(b) }])) } };
     else if (k === 'createdAt' || k === 'consentAt') fields[k] = { timestampValue: v };
     else if (typeof v === 'boolean') fields[k] = { booleanValue: v };
     else fields[k] = { stringValue: v };
@@ -171,6 +226,51 @@ async function storeFirestore(record) {
   const url = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(process.env.FIREBASE_PROJECT_ID)}/databases/${encodeURIComponent(process.env.FIREBASE_DATABASE_ID || '(default)')}/documents/${encodeURIComponent(COLLECTION)}`;
   const r = await fetch(url, { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ fields }) });
   if (!r.ok) throw new Error(`firestore ${r.status}`);
+}
+
+/* ---------- 알림 메일(Resend HTTP API, 선택) ---------- */
+const NOTIFY_EMAIL = /^[^\s@<>()[\]\\,;:"]{1,64}@[A-Za-z0-9.-]{1,180}\.[A-Za-z]{2,24}$/;
+// 일반 텍스트 본문용: 제어·방향 제어 문자 제거, 한 줄 항목은 개행을 공백으로, 길이 제한
+function plain(v, multiline, max) {
+  let s = String(v == null ? '' : v).replace(CONTROL, '').replace(/\r\n?/g, '\n');
+  s = multiline ? s.replace(/\n/g, '\n    ') : s.replace(/\n/g, ' ');
+  return [...s].slice(0, max || 200).join('');
+}
+function notifyText(record, field) {
+  const kst = new Date(new Date(record.createdAt).getTime() + 9 * 3600 * 1000).toISOString().replace('T', ' ').slice(0, 16) + ' (KST)';
+  const lines = [
+    '홈페이지에 새 상담 신청이 접수되었습니다.',
+    '',
+    `접수 시각: ${kst}`,
+    `상담 분야: ${plain(field.label)}`,
+    `이름: ${plain(record.name)}`,
+    `연락처: ${plain(record.phone)}`,
+  ];
+  for (const def of field.inputs) if (record.answers[def.name]) lines.push(`${plain(def.label)}: ${plain(record.answers[def.name])}`);
+  lines.push('상담 내용:', '    ' + (record.message ? plain(record.message, true, 1000) : '(없음)'));
+  lines.push('', '이메일·유입 경로 등 나머지 항목은 저장소(Firestore)에서 확인해 주세요.', '이 메일은 자동 발송되었습니다. 회신하지 마세요.');
+  return lines.join('\n');
+}
+async function notify(record, field) {
+  const key = process.env.RESEND_API_KEY;
+  const to = String(process.env.NOTIFY_TO || '').split(',').map((s) => s.trim()).filter((s) => NOTIFY_EMAIL.test(s)).slice(0, 5);
+  if (!key || !to.length) return 'skipped';
+  const fromEnv = String(process.env.NOTIFY_FROM || '').trim();
+  const from = /^[^\r\n<>]{0,60}<?[^\s@<>]+@[A-Za-z0-9.-]+>?$/.test(fromEnv) ? fromEnv : '홈페이지 상담 알림 <onboarding@resend.dev>';
+  const subject = `${CONFIG.notifySubjectPrefix || '[홈페이지상담]'} 새 상담 신청 1건 (${field.label})`;
+  try {
+    const r = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from, to, subject, text: notifyText(record, field) }),
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!r.ok) { console.error('consult notify failed: status', r.status); return 'failed'; }
+    return 'sent';
+  } catch (e) {
+    console.error('consult notify failed:', (e && e.name) || 'error'); // 메시지·키·입력값은 남기지 않음
+    return 'failed';
+  }
 }
 
 /* 로컬 테스트 전용 메모리 저장소 — Vercel 환경(VERCEL 변수 존재)에서는 활성화되지 않음 */
@@ -227,12 +327,19 @@ async function handler(req, res) {
     for (const d of CONFIG.consents) record['consent' + d.key[0].toUpperCase() + d.key.slice(1)] = consents[d.key] === true;
     record.consentAt = record.createdAt; // 동의 시각 = 제출(서버 수신) 시각
   }
+  // 유입 경로: 잘못된 값은 빈 값으로 대체(신청은 정상 처리)
+  const t = tracking(body);
+  Object.assign(record, t);
+  record.leadsCsv = { [CSV_COL.channel]: channelOf(t.utm_source, t.referrer), [CSV_COL.path]: t.utm_content, [CSV_COL.campaign]: t.utm_campaign };
 
-  if (testStoreEnabled()) { testStore.push(record); return send(res, 200, { ok: true }); }
-  if (!storageConfigured()) return send(res, 503, { ok: false, code: 'NOT_CONFIGURED' });
-  try { await storeFirestore(record); } catch (e) { console.error('consult store failed:', e && e.message); return send(res, 502, { ok: false, code: 'STORE' }); }
+  if (testStoreEnabled()) testStore.push(record);
+  else {
+    if (!storageConfigured()) return send(res, 503, { ok: false, code: 'NOT_CONFIGURED' });
+    try { await storeFirestore(record); } catch (e) { console.error('consult store failed:', e && e.message); return send(res, 502, { ok: false, code: 'STORE' }); }
+  }
+  await notify(record, field); // 저장 성공 후에만. 실패해도 접수는 성공으로 응답
   return send(res, 200, { ok: true });
 }
 
 module.exports = handler;
-module.exports._test = { validate, testStore, tokenAgeOk, issueToken };
+module.exports._test = { validate, testStore, tokenAgeOk, issueToken, cleanUtm, cleanUrl, channelOf, notifyText, CSV_COL };
