@@ -4,7 +4,7 @@ import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const out = resolve(root, 'dist');
-const files = ['index.html', 'style.css', 'script.js', 'consult.js', 'consult-forms.json', 'assets/logo-dark.svg', 'assets/fonts/SUIT-Variable.woff2', 'assets/fonts/SUIT-LICENSE.txt', 'assets/SIMPLE-ICONS-LICENSE.md'];
+const files = ['index.html', 'privacy.html', 'style.css', 'script.js', 'consult.js', 'consult-forms.json', 'assets/logo-dark.svg', 'assets/fonts/SUIT-Variable.woff2', 'assets/fonts/SUIT-LICENSE.txt', 'assets/SIMPLE-ICONS-LICENSE.md'];
 await rm(out, { recursive: true, force: true });
 let size = 0;
 for (const f of files) {

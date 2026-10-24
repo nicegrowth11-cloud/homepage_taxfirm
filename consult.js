@@ -74,12 +74,52 @@
       });
     }
     var wrap = h('div', { className: 'consult-row' + (def.half ? ' half' : '') }, [label, ctl]);
+    if (def.type === 'textarea' && config.messageNotice) {
+      ctl.setAttribute('aria-describedby', id + '-notice');
+      wrap.appendChild(h('p', { id: id + '-notice', className: 'consult-notice', text: config.messageNotice }));
+    }
     if (def.type === 'textarea') {
       var counter = h('small', { className: 'consult-count', text: '0 / ' + def.max });
       ctl.addEventListener('input', function () { counter.textContent = Array.from(ctl.value).length + ' / ' + def.max; });
       wrap.appendChild(counter);
     }
     return wrap;
+  }
+
+  /* 항목별 동의(기본 모두 해제). 필수 항목이 모두 체크되어야 제출 버튼이 활성화됩니다. */
+  function consentBlock() {
+    var box = h('fieldset', { className: 'consult-consents' }, [h('legend', { text: '개인정보 동의' })]);
+    config.consents.forEach(function (d) {
+      var id = 'c-consent-' + d.key;
+      var cb = h('input', { id: id, name: 'consent_' + d.key, type: 'checkbox', required: !!d.required, 'data-consent': d.key });
+      cb.addEventListener('change', syncSubmit);
+      var details = h('details', { className: 'consult-consent-detail' }, [
+        h('summary', { text: '상세 고지 보기' }),
+        d.title ? h('p', { className: 'consult-consent-title', text: d.title }) : null,
+        d.intro ? h('p', { text: d.intro }) : null,
+        d.items && d.items.length ? h('ul', {}, d.items.map(function (t) { return h('li', { text: t }); })) : null
+      ]);
+      box.appendChild(h('div', { className: 'consult-consent-item' }, [
+        h('label', { for: id }, [cb, h('span', { text: d.label })]),
+        details
+      ]));
+    });
+    return box;
+  }
+
+  function requiredConsentsOk() {
+    if (!config.consents) return true;
+    return config.consents.every(function (d) {
+      if (!d.required) return true;
+      var cb = els.form.querySelector('[data-consent="' + d.key + '"]');
+      return !!(cb && cb.checked);
+    });
+  }
+
+  function syncSubmit() {
+    var btn = els.form && els.form.querySelector('.consult-submit');
+    if (!btn || btn.getAttribute('aria-busy') === 'true') return;
+    btn.disabled = !requiredConsentsOk();
   }
 
   function showChooser() {
@@ -113,13 +153,17 @@
       h('label', { for: 'c-website', text: '웹사이트' }),
       h('input', { id: 'c-website', name: 'website', type: 'text', tabindex: '-1', autocomplete: 'off' })
     ]));
-    els.form.appendChild(h('div', { className: 'consult-consent' }, [
+    if (config.consents) els.form.appendChild(consentBlock());
+    else els.form.appendChild(h('div', { className: 'consult-consent' }, [
       h('label', { for: 'c-consent' }, [h('input', { id: 'c-consent', name: 'consent', type: 'checkbox', required: true }), ' [필수] 개인정보 수집·이용에 동의합니다']),
       h('ul', {}, config.consentItems.map(function (t) { return h('li', { text: t }); }))
     ]));
-    els.form.appendChild(h('button', { type: 'submit', className: 'button consult-submit', text: name + ' 신청하기' }));
+    var submitBtn = h('button', { type: 'submit', className: 'button consult-submit', text: name + ' 신청하기' });
+    els.form.appendChild(submitBtn);
     els.status.textContent = '';
     els.form.appendChild(els.status);
+    if (config.privacyUrl) els.form.appendChild(h('p', { className: 'consult-privacy' }, [h('a', { href: config.privacyUrl, target: '_blank', rel: 'noopener', text: '개인정보 처리방침' })]));
+    syncSubmit();
     var first = els.form.querySelector('.consult-grid select, .consult-grid input, .consult-grid textarea');
     if (first) first.focus();
   }
@@ -133,24 +177,34 @@
       var bad = form.querySelector(':invalid'); if (bad) bad.focus();
       return;
     }
-    var payload = { field: current.key, token: token, website: form.elements.website.value, consent: form.elements.consent.checked };
+    if (!requiredConsentsOk()) { els.status.textContent = '필수 동의 항목에 체크해 주세요.'; return; }
+    var payload = { field: current.key, token: token, website: form.elements.website.value };
+    if (config.consents) {
+      payload.consents = {};
+      config.consents.forEach(function (d) { payload.consents[d.key] = !!form.querySelector('[data-consent="' + d.key + '"]').checked; });
+    } else payload.consent = form.elements.consent.checked;
     current.inputs.concat(config.common).forEach(function (d) { var v = form.elements[d.name].value.trim(); if (v) payload[d.name] = v; });
     var submit = form.querySelector('.consult-submit');
-    submit.disabled = true;
+    submit.disabled = true; submit.setAttribute('aria-busy', 'true');
     els.status.textContent = '보내는 중입니다…';
     fetch('/api/consult', { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
       .then(function (r) { return r.json().catch(function () { return {}; }).then(function (j) { return { status: r.status, body: j }; }); })
       .then(function (res) {
-        submit.disabled = false;
+        submit.removeAttribute('aria-busy'); syncSubmit(); if (!config.consents) submit.disabled = false;
         if (res.status === 200 && res.body.ok) { form.reset(); form.hidden = true; els.done.hidden = false; return; }
+        var code = res.body && res.body.code;
         els.status.textContent = ({
-          400: res.body.code === 'TIMING' ? '잠시 후 다시 시도해 주세요.' : '입력 내용을 다시 확인해 주세요.',
+          400: code === 'TIMING' ? '잠시 후 다시 시도해 주세요.'
+            : code === 'SENSITIVE' ? '주민등록번호·계좌번호 등 민감한 정보가 포함된 것 같습니다. 해당 내용을 지우고 다시 신청해 주세요.'
+            : code === 'CONSENT' ? '필수 동의 항목에 체크해 주세요.'
+            : '입력 내용을 다시 확인해 주세요.',
           413: '입력 내용이 너무 깁니다. 문의 내용을 줄여 주세요.',
           429: '짧은 시간에 여러 번 신청되어 잠시 제한되었습니다. 잠시 후 다시 시도해 주세요.',
-          503: '온라인 접수를 준비하고 있습니다. ' + PHONE_TEXT + '로 연락 부탁드립니다.'
+          503: '접수 일시 오류: 지금은 온라인 접수가 되지 않습니다. ' + PHONE_TEXT + '로 연락 부탁드립니다.',
+          502: '접수 일시 오류: 잠시 후 다시 시도하시거나 ' + PHONE_TEXT + '로 연락 부탁드립니다.'
         })[res.status] || '접수 중 문제가 생겼습니다. ' + PHONE_TEXT + '로 연락 부탁드립니다.';
       })
-      .catch(function () { submit.disabled = false; els.status.textContent = '네트워크 연결을 확인해 주세요. ' + PHONE_TEXT; });
+      .catch(function () { submit.removeAttribute('aria-busy'); submit.disabled = false; syncSubmit(); els.status.textContent = '네트워크 연결을 확인해 주세요. ' + PHONE_TEXT; });
   }
 
   function loadConfig() {

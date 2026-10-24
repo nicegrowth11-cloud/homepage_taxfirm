@@ -10,6 +10,8 @@
  *  - IP 기준 레이트 리밋(인스턴스 메모리, 10분 5회) — 보조 수단, 운영 시 Vercel WAF 규칙 권장
  *  - 저장: Firestore REST(서비스 계정은 서버 환경변수에만 존재). 미설정 시 503
  *  - 원본 IP·User-Agent 미저장, 응답에 입력값을 되돌려주지 않음
+ *  - 민감정보 차단: 주민등록번호·계좌번호 형태가 입력되면 저장하지 않고 400(SENSITIVE)
+ *  - 동의: consent-forms.json 의 consents(항목별 필수/선택)가 있으면 항목별 동의값·동의 시각·문구 버전을 함께 저장
  */
 const crypto = require('crypto');
 const CONFIG = require('../consult-forms.json');
@@ -25,6 +27,20 @@ const hits = new Map();
 const CONTROL = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F\u202A-\u202E\u2066-\u2069]/g;
 const PHONE = /^0\d{1,2}-?\d{3,4}-?\d{4}$/;
 const EMAIL = /^[^\s@<>()[\]\\,;:"]{1,64}@[A-Za-z0-9.-]{1,180}\.[A-Za-z]{2,24}$/;
+// 주민등록번호(외국인등록번호 포함): 생년월일 6자리 + 성별자리(1~8) + 6자리
+const RRN = /(?:^|\D)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\s*-?\s*[1-8]\d{6}(?!\d)/;
+// 계좌·카드번호 추정: 숫자 사이 하이픈/공백 허용, 숫자 11~16자리 덩어리(전화번호·사업자등록번호 형태는 제외)
+const DIGIT_RUN = /\d[\d\- ]{9,22}\d/g;
+const PHONE_LIKE = /^(?:0\d{1,2}[- ]?\d{3,4}[- ]?\d{4}|\d{3}-\d{2}-\d{5})$/;
+function hasSensitive(v) {
+  if (RRN.test(v)) return true;
+  for (const m of v.match(DIGIT_RUN) || []) {
+    const run = m.trim();
+    const digits = run.replace(/\D/g, '').length;
+    if (digits >= 11 && digits <= 16 && !PHONE_LIKE.test(run)) return true;
+  }
+  return false;
+}
 
 function send(res, status, body, extra) {
   res.statusCode = status;
@@ -90,6 +106,7 @@ function checkInput(def, raw, errors) {
   if (v === null) { errors.push(def.name); return undefined; }
   if (!v) { if (def.required) errors.push(def.name); return undefined; }
   if (def.type === 'select') { if (!def.options.includes(v)) errors.push(def.name); return v; }
+  if (def.type !== 'tel' && hasSensitive(v)) { errors.push('sensitive'); return undefined; }
   const len = [...v].length;
   if (len > (def.max || 100) || len < (def.min || 1)) { errors.push(def.name); return undefined; }
   if (def.type !== 'textarea' && (/[<>]/.test(v) || v.includes('\n'))) { errors.push(def.name); return undefined; }
@@ -104,12 +121,26 @@ function validate(body) {
   const field = CONFIG.fields.find((f) => f.key === body.field);
   if (!field) return { errors: ['field'] };
   const defs = [...field.inputs, ...CONFIG.common];
-  const allowedKeys = new Set(['field', 'website', 'token', 'consent', ...defs.map((d) => d.name)]);
+  const consentKey = CONFIG.consents ? 'consents' : 'consent';
+  const allowedKeys = new Set(['field', 'website', 'token', consentKey, ...defs.map((d) => d.name)]);
   for (const k of Object.keys(body)) if (!allowedKeys.has(k)) errors.push('unknown');
   const data = {};
   for (const def of defs) { const v = checkInput(def, body[def.name], errors); if (v !== undefined) data[def.name] = v; }
-  if (body.consent !== true) errors.push('consent');
-  return { errors, field, data };
+  const consents = {};
+  if (CONFIG.consents) {
+    const c = body.consents;
+    if (!c || typeof c !== 'object' || Array.isArray(c)) errors.push('consent');
+    else {
+      for (const k of Object.keys(c)) if (!CONFIG.consents.some((d) => d.key === k)) errors.push('unknown');
+      for (const d of CONFIG.consents) {
+        const v = c[d.key] === undefined ? false : c[d.key];
+        if (typeof v !== 'boolean') errors.push('consent');
+        else if (d.required && v !== true) errors.push('consent');
+        else consents[d.key] = v;
+      }
+    }
+  } else if (body.consent !== true) errors.push('consent');
+  return { errors, field, data, consents };
 }
 
 /* ---------- Firestore (REST + 서비스 계정 JWT) ---------- */
@@ -133,11 +164,11 @@ async function storeFirestore(record) {
   const fields = {};
   for (const [k, v] of Object.entries(record)) {
     if (k === 'answers') fields.answers = { mapValue: { fields: Object.fromEntries(Object.entries(v).map(([a, b]) => [a, { stringValue: b }])) } };
-    else if (k === 'createdAt') fields.createdAt = { timestampValue: v };
+    else if (k === 'createdAt' || k === 'consentAt') fields[k] = { timestampValue: v };
     else if (typeof v === 'boolean') fields[k] = { booleanValue: v };
     else fields[k] = { stringValue: v };
   }
-  const url = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(process.env.FIREBASE_PROJECT_ID)}/databases/(default)/documents/${encodeURIComponent(COLLECTION)}`;
+  const url = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(process.env.FIREBASE_PROJECT_ID)}/databases/${encodeURIComponent(process.env.FIREBASE_DATABASE_ID || '(default)')}/documents/${encodeURIComponent(COLLECTION)}`;
   const r = await fetch(url, { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ fields }) });
   if (!r.ok) throw new Error(`firestore ${r.status}`);
 }
@@ -180,7 +211,9 @@ async function handler(req, res) {
   if (body && typeof body === 'object' && typeof body.website === 'string' && body.website.trim() !== '') return send(res, 200, { ok: true });
   if (!tokenAgeOk(body && body.token, now)) return send(res, 400, { ok: false, code: 'TIMING' });
 
-  const { errors, field, data } = validate(body);
+  const { errors, field, data, consents } = validate(body);
+  if (errors.includes('sensitive')) return send(res, 400, { ok: false, code: 'SENSITIVE' });
+  if (errors.length && errors.every((e) => e === 'consent')) return send(res, 400, { ok: false, code: 'CONSENT' });
   if (errors.length) return send(res, 400, { ok: false, code: 'INVALID', fields: [...new Set(errors)].slice(0, 10) });
 
   const answers = {};
@@ -189,6 +222,11 @@ async function handler(req, res) {
     site: CONFIG.site, field: field.key, name: data.name, phone: data.phone, email: data.email || '', message: data.message || '',
     answers, consent: true, consentVersion: CONFIG.consentVersion, status: 'new', createdAt: new Date(now).toISOString(),
   };
+  if (CONFIG.consents) {
+    delete record.consent;
+    for (const d of CONFIG.consents) record['consent' + d.key[0].toUpperCase() + d.key.slice(1)] = consents[d.key] === true;
+    record.consentAt = record.createdAt; // 동의 시각 = 제출(서버 수신) 시각
+  }
 
   if (testStoreEnabled()) { testStore.push(record); return send(res, 200, { ok: true }); }
   if (!storageConfigured()) return send(res, 503, { ok: false, code: 'NOT_CONFIGURED' });
