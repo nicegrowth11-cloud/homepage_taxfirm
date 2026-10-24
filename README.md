@@ -11,3 +11,6 @@ GitHub의 main 브랜치를 Vercel에 연결합니다. Framework Preset: Other. 
 - script.js: 모바일 메뉴
 
 유튜브 영상과 SNS 주소는 제공 후 연결합니다.
+
+## 2026-10-24 업데이트
+상담 분야 선택·전화 신청, 메모리 전용 메모(전송/저장 없음), 구체적인 준비자료 FAQ, 사용자 제공 사업자 정보, 자체 호스팅 고운돋움 폰트, 보안 헤더 적용. 보안 검토 범위와 한계는 SECURITY.md 참고. 운영 배포는 GitHub main → Vercel 자동 배포.
